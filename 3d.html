@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>3D Open World (Three.js) — Demo</title>
+<style>
+  html,body { height:100%; margin:0; overflow:hidden; background:#87ceeb; }
+  #overlay {
+    position:fixed; left:10px; top:10px; z-index:20;
+    background:rgba(0,0,0,0.45); color:#fff; padding:10px; border-radius:6px;
+    font-family:system-ui,Segoe UI,Roboto,Arial; font-size:13px;
+  }
+  #minimap {
+    position: fixed; right: 10px; top: 10px; width:160px; height:160px; z-index:20;
+    border-radius:6px; background:rgba(255,255,255,0.9); box-shadow:0 6px 18px rgba(0,0,0,0.25);
+  }
+  #instructions {
+    position:fixed; left:50%; transform:translateX(-50%); bottom:30px; z-index:20;
+    background:rgba(0,0,0,0.55); color:white; padding:12px 18px; border-radius:8px;
+    font-family:monospace; font-size:14px;
+  }
+  #hud {
+    position:fixed; left:10px; bottom:10px; z-index:20; color:white; font-family:monospace;
+    background:rgba(0,0,0,0.45); padding:8px 10px; border-radius:6px;
+  }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <strong>Open World Demo</strong><br>
+  Click canvas to lock pointer. WASD to move, Space jump, Shift to run.<br>
+  Collect items (yellow crystals). <span id="collected">0</span>
+</div>
+<canvas id="minimap"></canvas>
+<div id="instructions">Click to play — move with WASD, look with mouse</div>
+<div id="hud">Pos: <span id="pos">0,0,0</span></div>
+
+<script type="module">
+// --- Imports from CDN (Three.js + controls) ---
+import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+import { PointerLockControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/PointerLockControls.js';
+
+// ---------------- Utility: Perlin noise ----------------
+// Small Perlin noise implementation (2D) adapted for terrain generation.
+class Perlin {
+  constructor(seed = 0) {
+    this.p = new Uint8Array(512);
+    const rng = mulberry32(seed);
+    for (let i = 0; i < 256; i++) this.p[i] = i;
+    for (let i = 255; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      const tmp = this.p[i]; this.p[i] = this.p[j]; this.p[j] = tmp;
+    }
+    for (let i = 0; i < 256; i++) this.p[i + 256] = this.p[i];
+  }
+  noise(x, y) {
+    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+    x -= Math.floor(x); y -= Math.floor(y);
+    const u = fade(x), v = fade(y);
+    const A = this.p[X]+Y, AA = this.p[A], AB = this.p[A+1];
+    const B = this.p[X+1]+Y, BA = this.p[B], BB = this.p[B+1];
+
+    return lerp(v,
+      lerp(u, grad(this.p[AA], x, y), grad(this.p[BA], x-1, y)),
+      lerp(u, grad(this.p[AB], x, y-1), grad(this.p[BB], x-1, y-1))
+    );
+  }
+}
+function fade(t){ return t*t*t*(t*(t*6-15)+10); }
+function lerp(t,a,b){ return a + t*(b-a); }
+function grad(hash,x,y){ const h = hash & 3; const u = h<2 ? x : y; const v = h<2 ? y : x; return ((h&1)? -u : u) + ((h&2)? -2*v : 2*v); }
+function mulberry32(a) { return function(){ let t = a += 0x6D2B79F5; t = Math.imul(t ^ t>>>15, t | 1); t ^= t + Math.imul(t ^ t>>>7, t | 61); return ((t ^ t>>>14) >>> 0) / 4294967296; } }
+
+// ---------------- Scene setup ----------------
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x88ccee, 0.0009);
+
+const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 2000);
+camera.position.set(0, 12, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// Lights
+const hemi = new THREE.HemisphereLight(0xbfdfff, 0x404040, 0.9);
+scene.add(hemi);
+
+const sun = new THREE.DirectionalLight(0xfff9d7, 1.0);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048,2048);
+sun.shadow.camera.near = 0.5; sun.shadow.camera.far = 1000;
+sun.shadow.camera.left = -200; sun.shadow.camera.right = 200;
+sun.shadow.camera.top = 200; sun.shadow.camera.bottom = -200;
+sun.position.set(100,200,100);
+scene.add(sun);
+
+// Ground / Terrain generation
+const TERRAIN_SIZE = 1500;
+const TERRAIN_SEGMENTS = 200; // lower->faster
+const seed = Math.floor(Math.random()*1000000);
+const perlin = new Perlin(seed);
+
+const planeGeo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEGMENTS, TERRAIN_SEGMENTS);
+planeGeo.rotateX(-Math.PI/2);
+
+// displace vertices with layered noise for hills
+const heights = []; // store heights for lookup
+for (let i=0;i<planeGeo.attributes.position.count;i++){
+  const vx = planeGeo.attributes.position.getX(i);
+  const vz = planeGeo.attributes.position.getZ(i);
+  const nx = (vx + TERRAIN_SIZE/2)/100;
+  const nz = (vz + TERRAIN_SIZE/2)/100;
+  // multiple octaves
+  let h = 0;
+  h += 40 * perlin.noise(nx*0.6, nz*0.6);
+  h += 22 * perlin.noise(nx*1.6, nz*1.6);
+  h += 6 * perlin.noise(nx*3.5, nz*3.5);
+  h = Math.pow(h,1.05);
+  planeGeo.attributes.position.setY(i, h);
+  heights.push(h);
+}
+planeGeo.computeVertexNormals();
+
+const groundMat = new THREE.MeshStandardMaterial({ color:0x5b8b4a, roughness:1, metalness:0 });
+const ground = new THREE.Mesh(planeGeo, groundMat);
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Simple textured-looking shading: vertex displacement color variation
+const vcol = new Float32Array( planeGeo.attributes.position.count * 3 );
+for ( let i = 0; i < planeGeo.attributes.position.count; i++ ) {
+  const h = planeGeo.attributes.position.getY(i);
+  const t = THREE.MathUtils.clamp( (h - 4) / 40, 0, 1 );
+  const c = new THREE.Color().lerpColors(new THREE.Color(0x7fb86f), new THREE.Color(0x3f6a2f), t);
+  vcol[i*3] = c.r; vcol[i*3+1] = c.g; vcol[i*3+2] = c.b;
+}
+planeGeo.setAttribute('color', new THREE.BufferAttribute( vcol, 3 ));
+ground.material.vertexColors = true;
+
+// water plane (low elevation)
+const waterGeo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, 2,2);
+waterGeo.rotateX(-Math.PI/2);
+const water = new THREE.Mesh(waterGeo, new THREE.MeshStandardMaterial({ color:0x4ea3d3, transparent:true, opacity:0.6 }));
+water.position.y = 1.6;
+scene.add(water);
+
+// ---------------- Scatter trees & collectables ----------------
+const trees = new THREE.Group();
+scene.add(trees);
+
+const treeCount = 350;
+const collectables = [];
+const collectGroup = new THREE.Group();
+scene.add(collectGroup);
+
+for (let i=0;i<treeCount;i++){
+  const x = (Math.random()-0.5) * TERRAIN_SIZE * 0.9;
+  const z = (Math.random()-0.5) * TERRAIN_SIZE * 0.9;
+  const y = heightAt(x,z);
+  if (y < 2.2) continue; // avoid trees in water
+
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.6,0.9,3,6), new THREE.MeshStandardMaterial({color:0x5a3b2b}));
+  trunk.position.set(0,1.5,0);
+  trunk.castShadow = true;
+  const leaves = new THREE.Mesh(new THREE.ConeGeometry(3.4,7,6), new THREE.MeshStandardMaterial({color:0x2b7a33}));
+  leaves.position.set(0,5,0);
+  leaves.castShadow = true;
+  const tree = new THREE.Group();
+  tree.add(trunk); tree.add(leaves);
+  tree.position.set(x,y, z);
+  const s = 0.7 + Math.random()*0.9;
+  tree.scale.setScalar(s);
+  trees.add(tree);
+}
+
+// scatter collectables (crystals)
+for (let i=0;i<60;i++){
+  const x = (Math.random()-0.5) * TERRAIN_SIZE * 0.85;
+  const z = (Math.random()-0.5) * TERRAIN_SIZE * 0.85;
+  const y = heightAt(x,z) + 1.5;
+  if (y < 2.5) continue;
+  const geo = new THREE.OctahedronGeometry(1.0, 0);
+  const mat = new THREE.MeshStandardMaterial({ emissive:0xffff77, emissiveIntensity:1.2, color:0xffe87f});
+  const m = new THREE.Mesh(geo, mat);
+  m.position.set(x,y,z);
+  m.rotation.set(Math.random(), Math.random(), Math.random());
+  m.userData.collectible = true;
+  collectGroup.add(m);
+  collectables.push(m);
+}
+
+// ---------------- Player / Controls ----------------
+const controls = new PointerLockControls(camera, document.body);
+
+const blocker = document.getElementById('instructions');
+document.addEventListener('click', ()=> {
+  controls.lock();
+});
+controls.addEventListener('lock', ()=>{
+  blocker.style.display='none';
+});
+controls.addEventListener('unlock', ()=>{
+  blocker.style.display='block';
+});
+
+const velocity = new THREE.Vector3();
+const direction = new THREE.Vector3();
+let canJump = false;
+let isRunning = false;
+const move = { forward:false, back:false, left:false, right:false };
+
+document.addEventListener('keydown', (e)=> {
+  if (e.code === 'KeyW') move.forward = true;
+  if (e.code === 'KeyS') move.back = true;
+  if (e.code === 'KeyA') move.left = true;
+  if (e.code === 'KeyD') move.right = true;
+  if (e.code === 'Space' && canJump) { velocity.y += 14; canJump = false; }
+  if (e.shiftKey) isRunning = true;
+});
+document.addEventListener('keyup', (e)=> {
+  if (e.code === 'KeyW') move.forward = false;
+  if (e.code === 'KeyS') move.back = false;
+  if (e.code === 'KeyA') move.left = false;
+  if (e.code === 'KeyD') move.right = false;
+  if (!e.shiftKey) isRunning = false;
+});
+
+// place a little "body" capsule
+const player = { height: 1.8, speed: 6, position: new THREE.Vector3(0,10,0) };
+camera.position.copy(player.position);
+
+// ---------------- HUD and minimap ----------------
+const posEl = document.getElementById('pos');
+const collectedEl = document.getElementById('collected');
+let collectedCount = 0;
+
+const mm = document.getElementById('minimap');
+mm.width = 320; mm.height = 320;
+const mmCtx = mm.getContext('2d');
+
+// ---------------- Day/Night cycle ----------------
+let timeOfDay = Math.random() * Math.PI * 2;
+function updateSun(dt) {
+  timeOfDay += dt * 0.02; // slower rotate
+  const radius = 250;
+  const sx = Math.cos(timeOfDay) * radius;
+  const sy = Math.sin(timeOfDay) * radius;
+  sun.position.set(sx, sy, 100);
+  sun.intensity = Math.max(0.15, Math.sin(timeOfDay)*1.2);
+  hemi.intensity = Math.max(0.3, 0.6*(Math.sin(timeOfDay)*0.5 + 0.5));
+  // sky color interpolation
+  const t = THREE.MathUtils.clamp((Math.sin(timeOfDay) + 1)/2, 0, 1);
+  renderer.setClearColor(new THREE.Color().lerpColors(new THREE.Color(0x10122b), new THREE.Color(0x87ceeb), t));
+}
+
+// ---------------- Helpers ----------------
+function heightAt(x,z){
+  // sample plane geometry via bilinear lookup on grid
+  const half = TERRAIN_SIZE/2;
+  const gx = (x + half) / TERRAIN_SIZE * TERRAIN_SEGMENTS;
+  const gz = (z + half) / TERRAIN_SIZE * TERRAIN_SEGMENTS;
+  const ix = Math.floor(gx), iz = Math.floor(gz);
+  const u = gx - ix, v = gz - iz;
+  // clamp
+  const clamp = (a,min,max)=> Math.max(min, Math.min(max, a));
+  const i00 = clamp(ix + (iz*(TERRAIN_SEGMENTS+1)), 0, (TERRAIN_SEGMENTS+1)*(TERRAIN_SEGMENTS+1)-1);
+  const i10 = clamp((ix+1) + (iz*(TERRAIN_SEGMENTS+1)), 0, (TERRAIN_SEGMENTS+1)*(TERRAIN_SEGMENTS+1)-1);
+  const i01 = clamp(ix + ((iz+1)*(TERRAIN_SEGMENTS+1)), 0, (TERRAIN_SEGMENTS+1)*(TERRAIN_SEGMENTS+1)-1);
+  const i11 = clamp((ix+1) + ((iz+1)*(TERRAIN_SEGMENTS+1)), 0, (TERRAIN_SEGMENTS+1)*(TERRAIN_SEGMENTS+1)-1);
+  const y00 = planeGeo.attributes.position.getY(i00);
+  const y10 = planeGeo.attributes.position.getY(i10);
+  const y01 = planeGeo.attributes.position.getY(i01);
+  const y11 = planeGeo.attributes.position.getY(i11);
+  const y0 = y00*(1-u) + y10*u;
+  const y1 = y01*(1-u) + y11*u;
+  return y0*(1-v) + y1*v;
+}
+
+// ---------------- Animation loop ----------------
+let prevTime = performance.now();
+function animate(){
+  const time = performance.now();
+  const dt = (time - prevTime) / 1000;
+  prevTime = time;
+
+  if (controls.isLocked === true) {
+    // movement logic
+    const speed = player.speed * (isRunning ? 1.8 : 1.0);
+    direction.set( Number(move.right) - Number(move.left), 0, Number(move.back) - Number(move.forward) );
+    if (direction.lengthSq() > 0) direction.normalize();
+    // rotate direction by camera yaw
+    const quat = new THREE.Quaternion(); quat.setFromEuler(new THREE.Euler(0, camera.rotation.y, 0));
+    direction.applyQuaternion(quat);
+
+    // apply horizontal velocity
+    velocity.x -= velocity.x * 10.0 * dt;
+    velocity.z -= velocity.z * 10.0 * dt;
+    velocity.x += direction.x * speed * dt * 10;
+    velocity.z += direction.z * speed * dt * 10;
+
+    // gravity
+    velocity.y -= 30.0 * dt;
+    // propose new position
+    player.position.addScaledVector(velocity, dt);
+
+    // ground collision / snapping
+    const groundY = heightAt(player.position.x, player.position.z) + player.height;
+    if (player.position.y <= groundY) {
+      velocity.y = 0;
+      player.position.y = groundY;
+      canJump = true;
+    }
+
+    // keep player within terrain bounds
+    const limit = TERRAIN_SIZE*0.48;
+    player.position.x = THREE.MathUtils.clamp(player.position.x, -limit, limit);
+    player.position.z = THREE.MathUtils.clamp(player.position.z, -limit, limit);
+
+    // update camera via controls
+    controls.getObject().position.copy(player.position);
+
+    // check collectables proximity
+    for (let i = collectables.length-1; i>=0; i--){
+      const c = collectables[i];
+      if (!c) continue;
+      if (c.position.distanceTo(player.position) < 3.2) {
+        // collect
+        scene.remove(c);
+        collectables.splice(i,1);
+        collectedCount++;
+        collectedEl.textContent = String(collectedCount);
+      } else {
+        c.rotation.y += dt * 1.2;
+        c.position.y = heightAt(c.position.x, c.position.z) + 1.5 + Math.sin(time*0.002 + i)*0.25;
+      }
+    }
+  }
+
+  // update sun/day cycle
+  updateSun((time - prevTime)/1000);
+
+  // update HUD
+  posEl.textContent = `${player.position.x.toFixed(1)}, ${player.position.y.toFixed(1)}, ${player.position.z.toFixed(1)}`;
+
+  // minimap render
+  renderMinimap();
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+// ---------------- Resize ----------------
+window.addEventListener('resize', ()=>{
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// --------------- Minimap (canvas) ---------------
+function renderMinimap(){
+  const ctx = mmCtx;
+  ctx.save();
+  ctx.clearRect(0,0,mm.width, mm.height);
+  // background
+  ctx.fillStyle = '#e8f7ff'; ctx.fillRect(0,0,mm.width, mm.height);
+  // translate world coords to minimap coords
+  const scale = mm.width / (TERRAIN_SIZE * 0.8);
+  ctx.translate(mm.width/2, mm.height/2);
+  // draw trees as dark dots
+  ctx.fillStyle = '#2b7a33';
+  for (const t of trees.children){
+    const tx = t.position.x * scale;
+    const tz = t.position.z * scale;
+    ctx.fillRect(tx-1, tz-1, 2,2);
+  }
+  // draw collectables
+  ctx.fillStyle = '#ffcc33';
+  for (const c of collectables){
+    const cx = c.position.x * scale, cz = c.position.z * scale;
+    ctx.fillRect(cx-2, cz-2, 4, 4);
+  }
+  // draw player
+  ctx.fillStyle = '#ff0000';
+  ctx.beginPath();
+  ctx.arc(player.position.x * scale, player.position.z * scale, 4, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+}
+
+// ---------------- Small helpers for randomness ----------------
+function randRange(a,b){ return a + Math.random()*(b-a); }
+
+// ---------------- Start position ----------------
+// place player on a random gentle hill near center
+(function placePlayer(){
+  let tries = 0;
+  while (tries++ < 1000){
+    const x = randRange(-TERRAIN_SIZE*0.12, TERRAIN_SIZE*0.12);
+    const z = randRange(-TERRAIN_SIZE*0.12, TERRAIN_SIZE*0.12);
+    const y = heightAt(x,z) + player.height;
+    if (y > 2.8) { player.position.set(x,y,z); camera.position.copy(player.position); controls.getObject().position.copy(player.position); break; }
+  }
+})();
+
+// small ambient music / effect (optional) - keep silent in demo
+
+</script>
+</body>
+</html>
