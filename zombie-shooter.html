@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>2D Zombie Shooter</title>
+<style>
+  :root {
+    --bg: #0e0f13;
+    --panel: rgba(255,255,255,0.06);
+    --accent: #ff5a5f;
+    --muted: rgba(255,255,255,0.6);
+  }
+  html,body { height:100%; margin:0; background:var(--bg); color:#fff; font-family:Inter,system-ui,Arial; }
+  #gameWrap { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; gap:12px; padding:12px; box-sizing:border-box; }
+  canvas { background: linear-gradient(180deg,#0b0c0f, #111217); border-radius:8px; box-shadow: 0 6px 30px rgba(0,0,0,0.7); max-width:100%; height:auto; }
+  .hud { width:100%; max-width:900px; display:flex; justify-content:space-between; align-items:center; gap:12px; color:var(--muted); font-size:14px; }
+  .hud .left, .hud .right { background:var(--panel); padding:8px 12px; border-radius:8px; }
+  .controls { display:flex; gap:8px; align-items:center; }
+  .btn { background:transparent; border:1px solid rgba(255,255,255,0.06); padding:6px 10px; border-radius:6px; color:#fff; cursor:pointer; }
+  .centerMsg { text-align:center; color:#ddd; margin-top:8px; }
+  /* Mobile touch controls */
+  .touchControls { position:fixed; bottom:18px; left:18px; display:none; gap:10px; }
+  .touchControls .stick { width:110px; height:110px; border-radius:50%; background:rgba(255,255,255,0.04); display:flex; align-items:center; justify-content:center; }
+  .touchControls .shoot { position:fixed; right:18px; bottom:18px; width:84px; height:84px; border-radius:50%; background:rgba(255,90,95,0.14); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; color:#ffffff; }
+  @media (hover:none) and (pointer:coarse) {
+    .touchControls { display:flex; }
+    canvas { max-height:62vh; }
+  }
+</style>
+</head>
+<body>
+<div id="gameWrap">
+  <div class="hud" style="max-width:900px;">
+    <div class="left">
+      HP: <span id="hp">100</span> &nbsp;|&nbsp; Score: <span id="score">0</span> &nbsp;|&nbsp; Wave: <span id="wave">1</span>
+    </div>
+    <div class="right">
+      <div class="controls">
+        <button id="btnPause" class="btn">Pause</button>
+        <button id="btnRestart" class="btn">Restart</button>
+      </div>
+    </div>
+  </div>
+
+  <canvas id="game" width="900" height="600"></canvas>
+
+  <div class="centerMsg" id="centerMsg">Move with WASD or arrows. Aim with mouse. Click to shoot.</div>
+
+  <!-- Mobile touch UI -->
+  <div class="touchControls" id="touchControls">
+    <div class="stick" id="touchStick">⤫</div>
+  </div>
+  <div class="shoot" id="touchShoot" style="display:none;">Shoot</div>
+</div>
+
+<script>
+/* 2D Zombie Shooter
+   Single-file HTML5 Canvas game.
+   Controls:
+     - Keyboard: WASD or Arrow keys to move
+     - Mouse: Move to aim, Click to shoot
+     - Space: Dash
+     - Mobile: On-screen stick (drag) and Shoot button
+*/
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = canvas.width, H = canvas.height;
+
+function resizeCanvas() {
+  // Keep canvas internal resolution consistent, but scale CSS for responsiveness
+  const maxWidth = Math.min(window.innerWidth - 40, 900);
+  const scale = maxWidth / 900;
+  canvas.style.width = `${900 * scale}px`;
+  canvas.style.height = `${600 * scale}px`;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+/* Utilities */
+function rand(min, max) { return Math.random() * (max - min) + min; }
+function dist(a,b) { const dx=a.x-b.x, dy=a.y-b.y; return Math.sqrt(dx*dx+dy*dy); }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+/* Sound helper: short beeps using WebAudio */
+const audioCtx = (typeof AudioContext !== 'undefined') ? new AudioContext() : null;
+function beep(freq=440, length=0.06, type='sine', gain=0.08){
+  if(!audioCtx) return;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.value = gain;
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start();
+  o.stop(audioCtx.currentTime + length);
+}
+
+/* Game objects */
+class Player {
+  constructor(){
+    this.x = W/2; this.y = H/2;
+    this.r = 14;
+    this.speed = 180; // px/sec
+    this.hp = 100;
+    this.maxHp = 100;
+    this.shootCooldown = 0;
+    this.reloadTime = 0.15;
+    this.bullets = [];
+    this.score = 0;
+    this.dashCooldown = 0;
+    this.radius = this.r;
+  }
+  update(dt){
+    // movement
+    let vx=0, vy=0;
+    if(keys['ArrowUp']||keys['w']) vy -= 1;
+    if(keys['ArrowDown']||keys['s']) vy += 1;
+    if(keys['ArrowLeft']||keys['a']) vx -= 1;
+    if(keys['ArrowRight']||keys['d']) vx += 1;
+    if(touchInput.active){
+      vx += touchInput.vx;
+      vy += touchInput.vy;
+    }
+    const len = Math.hypot(vx, vy);
+    if(len > 0) { vx /= len; vy /= len; }
+    // apply movement
+    this.x += vx * this.speed * dt;
+    this.y += vy * this.speed * dt;
+
+    // dash
+    if(keys[' '] && this.dashCooldown <= 0){
+      beep(900, 0.04, 'square', 0.12);
+      this.x += vx * 140;
+      this.y += vy * 140;
+      this.dashCooldown = 1.1;
+    }
+
+    // clamp to bounds
+    this.x = clamp(this.x, this.r, W - this.r);
+    this.y = clamp(this.y, this.r, H - this.r);
+
+    // shooting
+    this.shootCooldown -= dt;
+    this.dashCooldown -= dt;
+    if((mouse.down || touchInput.shootDown) && this.shootCooldown <= 0){
+      this.shoot();
+      this.shootCooldown = this.reloadTime;
+    }
+
+    // update bullets
+    for(let i = this.bullets.length-1; i>=0; i--){
+      const b = this.bullets[i];
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.life -= dt;
+      if(b.life <= 0 || b.x < -10 || b.y < -10 || b.x > W+10 || b.y > H+10) this.bullets.splice(i,1);
+    }
+  }
+  shoot(){
+    // aim at mouse or touch
+    let tx = mouse.x, ty = mouse.y;
+    if(touchInput.active && !mouse.active) { tx = this.x + touchInput.aimX; ty = this.y + touchInput.aimY; }
+    const angle = Math.atan2(ty - this.y, tx - this.x);
+    const speed = 560;
+    const b = { x: this.x + Math.cos(angle) * (this.r+8), y: this.y + Math.sin(angle) * (this.r+8),
+                vx: Math.cos(angle)*speed, vy: Math.sin(angle)*speed, life: 1.6, r:4, dmg: 34 };
+    this.bullets.push(b);
+    beep(1200, 0.04, 'sine', 0.04);
+  }
+  draw(){
+    // player body
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.beginPath();
+    ctx.fillStyle = '#7fe3a5';
+    ctx.arc(0,0,this.r,0,Math.PI*2);
+    ctx.fill();
+    // eye / aim direction
+    const aimX = mouse.x - this.x, aimY = mouse.y - this.y;
+    const ang = Math.atan2(aimY, aimX);
+    ctx.fillStyle = '#08341a';
+    ctx.beginPath();
+    ctx.arc(Math.cos(ang)*6, Math.sin(ang)*6, 5, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+
+    // bullets
+    for(const b of this.bullets){
+      ctx.beginPath();
+      ctx.fillStyle = '#ffd97a';
+      ctx.arc(b.x, b.y, b.r, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+}
+
+class Zombie {
+  constructor(x,y, hp=60, speed=50){
+    this.x = x; this.y = y;
+    this.r = rand(14,22);
+    this.hp = hp;
+    this.maxHp = hp;
+    this.speed = speed;
+    this.color = `hsl(${rand(80,140)}, 30%, 40%)`;
+    this.dead = false;
+  }
+  update(dt, player){
+    const dx = player.x - this.x, dy = player.y - this.y;
+    const d = Math.hypot(dx,dy);
+    if(d > 0.1){
+      const nx = dx / d, ny = dy / d;
+      this.x += nx * this.speed * dt;
+      this.y += ny * this.speed * dt;
+    }
+  }
+  draw(){
+    // body
+    ctx.beginPath();
+    const c = ctx.createRadialGradient(this.x-4,this.y-4,this.r*0.1, this.x,this.y,this.r);
+    c.addColorStop(0, '#a4b06a');
+    c.addColorStop(1, '#46512e');
+    ctx.fillStyle = c;
+    ctx.arc(this.x, this.y, this.r, 0, Math.PI*2);
+    ctx.fill();
+    // eyes
+    ctx.fillStyle = '#f2f8ff';
+    ctx.fillRect(this.x - this.r*0.45, this.y - this.r*0.5, 6, 6);
+    ctx.fillRect(this.x + this.r*0.12, this.y - this.r*0.46, 6, 6);
+    // hp bar
+    const barW = this.r*1.6;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(this.x - barW/2, this.y - this.r - 10, barW, 5);
+    ctx.fillStyle = '#ff5a5f';
+    const hpW = (this.hp / this.maxHp) * barW;
+    ctx.fillRect(this.x - barW/2, this.y - this.r - 10, hpW, 5);
+  }
+}
+
+/* Game state */
+const player = new Player();
+let zombies = [];
+let lastTime = null;
+let spawnTimer = 0;
+let spawnInterval = 1.6;
+let wave = 1;
+let zombiesToSpawn = 6;
+let gameOver = false;
+let paused = false;
+
+/* Input */
+const keys = {};
+const mouse = { x: W/2, y: H/2, down:false, active:true };
+const touchInput = { active:false, vx:0, vy:0, aimX:0, aimY:0, shootDown:false };
+
+window.addEventListener('keydown', e => { keys[e.key] = true; if(e.key === 'p') togglePause(); });
+window.addEventListener('keyup', e => { keys[e.key] = false; });
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width, scaleY = canvas.height / rect.height;
+  mouse.x = (e.clientX - rect.left) * scaleX;
+  mouse.y = (e.clientY - rect.top) * scaleY;
+});
+canvas.addEventListener('mousedown', e => { mouse.down = true; if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); });
+window.addEventListener('mouseup', e => { mouse.down = false; });
+
+/* Touch controls: simple stick for movement and shoot button */
+const touchStickEl = document.getElementById('touchStick');
+const touchShootEl = document.getElementById('touchShoot');
+function showTouchControls(){
+  if(('ontouchstart' in window) || navigator.maxTouchPoints > 0){
+    touchStickEl.style.display = 'flex';
+    touchShootEl.style.display = 'flex';
+    touchShootEl.style.right = '18px';
+  } else {
+    touchStickEl.style.display = 'none';
+    touchShootEl.style.display = 'none';
+  }
+}
+showTouchControls();
+
+let stickCenter = null;
+let stickId = null;
+touchStickEl.addEventListener('touchstart', (ev)=>{
+  ev.preventDefault();
+  const t = ev.changedTouches[0];
+  stickId = t.identifier;
+  const rect = touchStickEl.getBoundingClientRect();
+  stickCenter = { x: rect.left + rect.width/2, y: rect.top + rect.height/2 };
+  touchInput.active = true;
+});
+touchStickEl.addEventListener('touchmove', (ev)=>{
+  ev.preventDefault();
+  for(const t of ev.changedTouches){
+    if(t.identifier === stickId){
+      const dx = (t.clientX - stickCenter.x) / 60;
+      const dy = (t.clientY - stickCenter.y) / 60;
+      touchInput.vx = clamp(dx, -1, 1);
+      touchInput.vy = clamp(dy, -1, 1);
+      touchInput.aimX = (t.clientX - stickCenter.x) * 2;
+      touchInput.aimY = (t.clientY - stickCenter.y) * 2;
+      break;
+    }
+  }
+});
+touchStickEl.addEventListener('touchend', (ev)=>{
+  for(const t of ev.changedTouches){
+    if(t.identifier === stickId){
+      stickId = null;
+      touchInput.active = false;
+      touchInput.vx = 0; touchInput.vy = 0; touchInput.aimX=0; touchInput.aimY=0;
+      break;
+    }
+  }
+});
+
+touchShootEl.addEventListener('touchstart', (e)=>{ e.preventDefault(); touchInput.shootDown = true; if(audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); });
+touchShootEl.addEventListener('touchend', (e)=>{ e.preventDefault(); touchInput.shootDown = false; });
+
+/* Spawn logic */
+function spawnZombie() {
+  // spawn outside edges
+  const edge = Math.floor(rand(0,4));
+  let x, y;
+  if(edge === 0){ x = rand(-80, -20); y = rand(-80, H+80); }
+  else if(edge === 1){ x = rand(W+20, W+80); y = rand(-80, H+80); }
+  else if(edge === 2){ x = rand(-80, W+80); y = rand(-80, -20); }
+  else { x = rand(-80, W+80); y = rand(H+20, H+80); }
+
+  const hp = rand(45, 100) + wave*6;
+  const speed = rand(30, 80) + wave*2;
+  zombies.push(new Zombie(x,y,hp,speed));
+}
+
+/* Collision helpers */
+function circleCollide(a,b){
+  const dx = a.x - b.x, dy = a.y - b.y;
+  return dx*dx + dy*dy <= (a.r + b.r) * (a.r + b.r);
+}
+
+/* Game update/draw loop */
+function update(time) {
+  if(lastTime === null) lastTime = time;
+  const dt = Math.min(0.033, (time - lastTime)/1000); // cap dt
+  lastTime = time;
+  if(!paused && !gameOver){
+    player.update(dt);
+
+    // spawn zombies
+    spawnTimer -= dt;
+    if(spawnTimer <= 0 && zombiesToSpawn > 0){
+      spawnZombie();
+      spawnTimer = spawnInterval * rand(0.7, 1.2);
+      zombiesToSpawn--;
+    }
+    // if wave cleared, start next wave
+    if(zombies.length === 0 && zombiesToSpawn === 0){
+      wave++;
+      zombiesToSpawn = Math.min(12 + wave*3, 60);
+      spawnInterval = Math.max(0.35, spawnInterval * 0.94);
+      document.getElementById('centerMsg').innerText = `Wave ${wave} incoming!`;
+      setTimeout(()=>{ document.getElementById('centerMsg').innerText = 'Move with WASD/Arrows. Aim & shoot with mouse.'; }, 1400);
+      beep(600,0.12,'sine',0.06);
+    }
+
+    // update zombies
+    for(let i=zombies.length-1; i>=0; i--){
+      const z = zombies[i];
+      z.update(dt, player);
+
+      // check collision with bullets
+      for(let j=player.bullets.length-1; j>=0; j--){
+        const b = player.bullets[j];
+        const dx=b.x - z.x, dy=b.y - z.y;
+        if(dx*dx + dy*dy <= (b.r + z.r)*(b.r + z.r)){
+          z.hp -= b.dmg;
+          player.bullets.splice(j,1);
+          beep(1600,0.02,'sine',0.02);
+          if(z.hp <= 0){
+            // killed
+            player.score += Math.floor(z.maxHp/10) + 5;
+            document.getElementById('score').innerText = player.score;
+            zombies.splice(i,1);
+            beep(420,0.08,'sawtooth',0.04);
+            break;
+          }
+        }
+      }
+      // check collision with player
+      if(circleCollide(z, player)){
+        // damage over time
+        if(!z._hitCooldown) z._hitCooldown = 0;
+        z._hitCooldown -= dt;
+        if(z._hitCooldown <= 0){
+          player.hp -= Math.floor(rand(6,13));
+          z._hitCooldown = 0.45;
+          beep(140,0.06,'sine',0.08);
+          if(player.hp <= 0){
+            player.hp = 0;
+            gameOver = true;
+            beep(70,0.6,'sine',0.08);
+          }
+        }
+      }
+    }
+
+    // update UI
+    document.getElementById('hp').innerText = Math.max(0, Math.floor(player.hp));
+    document.getElementById('wave').innerText = wave;
+  }
+
+  draw();
+  if(!gameOver) requestAnimationFrame(update);
+  else showGameOver();
+}
+
+function draw() {
+  // background
+  ctx.clearRect(0,0,W,H);
+
+  // slight vignette
+  ctx.save();
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'rgba(0,0,0,0.05)');
+  g.addColorStop(1,'rgba(0,0,0,0.18)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+  ctx.restore();
+
+  // draw zombies behind
+  for(const z of zombies) z.draw();
+
+  // draw player
+  player.draw();
+
+  // draw HUD crosshair
+  ctx.beginPath();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.moveTo(mouse.x - 8, mouse.y); ctx.lineTo(mouse.x + 8, mouse.y);
+  ctx.moveTo(mouse.x, mouse.y - 8); ctx.lineTo(mouse.x, mouse.y + 8);
+  ctx.stroke();
+
+  // paused overlay
+  if(paused){
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = '#fff';
+    ctx.font = '36px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText('Paused', W/2, H/2 - 10);
+    ctx.font = '16px system-ui';
+    ctx.fillText('Press P to resume', W/2, H/2 + 20);
+  }
+}
+
+/* Start & controls */
+function startGame(){
+  // reset
+  zombies = [];
+  player.x = W/2; player.y = H/2;
+  player.hp = player.maxHp;
+  player.bullets = [];
+  player.score = 0;
+  document.getElementById('score').innerText = 0;
+  document.getElementById('hp').innerText = player.hp;
+  wave = 1;
+  spawnInterval = 1.6;
+  zombiesToSpawn = 8;
+  spawnTimer = 0;
+  gameOver = false;
+  paused = false;
+  document.getElementById('centerMsg').innerText = 'Wave 1 starting!';
+  lastTime = null;
+  requestAnimationFrame(update);
+}
+
+function showGameOver(){
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = '#ffb4b4';
+  ctx.font = '42px system-ui';
+  ctx.textAlign = 'center';
+  ctx.fillText('GAME OVER', W/2, H/2 - 24);
+  ctx.font = '18px system-ui';
+  ctx.fillStyle = '#fff';
+  ctx.fillText(`Score: ${player.score}   Waves survived: ${wave}`, W/2, H/2 + 12);
+  document.getElementById('centerMsg').innerText = 'Press Restart to play again.';
+}
+
+function togglePause(){
+  paused = !paused;
+  if(!paused) { lastTime = null; requestAnimationFrame(update); }
+}
+
+/* Buttons */
+document.getElementById('btnPause').addEventListener('click', ()=>{
+  togglePause();
+  document.getElementById('btnPause').innerText = paused ? 'Resume' : 'Pause';
+});
+document.getElementById('btnRestart').addEventListener('click', ()=>{
+  startGame();
+  document.getElementById('btnPause').innerText = 'Pause';
+});
+
+/* init */
+startGame();
+
+/* make sure canvas mouse coords are set initially (center) */
+const rect = canvas.getBoundingClientRect();
+mouse.x = canvas.width/2; mouse.y = canvas.height/2;
+
+/* Helpful: pause game when page hidden */
+document.addEventListener('visibilitychange', ()=>{
+  if(document.hidden && !gameOver){ paused = true; document.getElementById('btnPause').innerText = 'Resume'; }
+});
+</script>
+</body>
+</html>
